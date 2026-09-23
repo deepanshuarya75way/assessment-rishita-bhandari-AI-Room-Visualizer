@@ -32,20 +32,29 @@ WALL_OCCLUDER_IDS = {
     69,  # bookcase
     75,  # swivel chair
     80,  # bathtub
+    35,  # television / screen
+    41,  # box / storage crate / trunk
     89,  # television / screen
+    92,  # apparel / clothing / hanging clothes / coats / jackets
+    100, # poster / bulletin board / wall picture
+    111, # bulletin board / board
+    115, # bag / handbag / backpack
+    127, # whiteboard / blackboard / signboard
     128, # refrigerator
+    138, # footwear / shoes
+    142, # shoe / footwear
 }
 
 class WallEngine:
     def __init__(self):
         pass
 
-    def extract_wall_mask(self, seg_map, floor_mask=None, depth_map=None):
+    def extract_wall_mask(self, seg_map, floor_mask=None, depth_map=None, image_bgr=None):
         """
         Extracts clean, occlusion-free wall mask.
         Enforces strict mutual exclusivity with floor_mask and preserves doors,
         windows, paintings, TVs, ceilings, and all foreground furniture.
-        Suppresses clothes, cushions, boxes, shoes, and non-structural items.
+        Preserves hanging clothes, boxes, footwear, and wall-mounted objects (whiteboard, hooks).
         """
         H, W = seg_map.shape[:2]
 
@@ -56,6 +65,28 @@ class WallEngine:
 
         # Build strict wall occluder mask with protected structural objects only
         occluders = np.isin(seg_map, list(WALL_OCCLUDER_IDS)).astype(np.uint8) * 255
+
+        # Preserve wall-mounted objects (whiteboard, hung bags/hangers, switchboards)
+        if image_bgr is not None:
+            hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+            s_chan = hsv[:, :, 1]
+            v_chan = hsv[:, :, 2]
+            b_chan, g_chan, r_chan = image_bgr[:, :, 0], image_bgr[:, :, 1], image_bgr[:, :, 2]
+
+            # Whiteboard/signboard/paper: achromatic white region on wall (low saturation, high value, neutral BGR)
+            is_wb = (s_chan < 26) & (v_chan > 175) & (np.abs(r_chan.astype(int) - b_chan.astype(int)) <= 15) & (np.abs(g_chan.astype(int) - b_chan.astype(int)) <= 15)
+            # Distinct wall-hung items (pouches, hangers) with distinct hue/chroma from ambient wall
+            is_hung = (hsv[:, :, 0] >= 42) & (hsv[:, :, 0] <= 145) & (s_chan > 60)
+
+            cand_mounted = (is_wb | is_hung) & (wall_raw > 0)
+            num_m, labels_m, stats_m, _ = cv2.connectedComponentsWithStats(cand_mounted.astype(np.uint8))
+            for lbl in range(1, num_m):
+                area_m = stats_m[lbl, cv2.CC_STAT_AREA]
+                y_m = stats_m[lbl, cv2.CC_STAT_TOP]
+                h_m = stats_m[lbl, cv2.CC_STAT_HEIGHT]
+                w_m = stats_m[lbl, cv2.CC_STAT_WIDTH]
+                if 50 < area_m < (W * H * 0.15) and y_m > (H * 0.12) and (y_m + h_m) < (H * 0.92) and w_m < (W * 0.45):
+                    occluders[labels_m == lbl] = 255
 
         # Strict Mutual Exclusivity: Zero overlap between floor and wall
         if floor_mask is not None:
@@ -89,14 +120,19 @@ class WallEngine:
                             elif y_line < curr_bot:
                                 wall_clean[y_line + 1:curr_bot + 1, c] = 0
 
-        # Morphological Clutter Hole Healing on wall surface
+        # Morphological Clutter Hole Healing on wall surface (micro-voids only, max 200px)
         cnts_w, hier_w = cv2.findContours(wall_clean, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         if hier_w is not None:
-            max_hole_area = int(W * H * 0.015)
+            max_hole_area = min(200, int(W * H * 0.0003))
             for i, c in enumerate(cnts_w):
                 if hier_w[0][i][3] != -1:  # Internal hole enclosed by wall
                     if cv2.contourArea(c) < max_hole_area:
                         cv2.drawContours(wall_clean, [c], -1, 255, thickness=-1)
+
+        # Enforce strict protection of all structural occluders and floor mutual exclusivity
+        wall_clean[occluders > 0] = 0
+        if floor_mask is not None:
+            wall_clean[floor_mask > 0] = 0
 
         # Retain significant connected wall structures
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(wall_clean, connectivity=8)
@@ -279,7 +315,7 @@ class WallEngine:
             [x_min, y_max]
         ]
 
-    def warp_wall_material(self, room_bgr, tile_surface, dest_quad, mask_bool, shadow_strength=0.55, finish="matte", fg_alpha=None):
+    def warp_wall_material(self, room_bgr, tile_surface, dest_quad, mask_bool, shadow_strength=0.55, finish="satin", fg_alpha=None, luminance_map=None, contact_shadow_map=None, contact_footprint=None):
         """
         Applies photorealistic perspective homography warping and illumination preservation to walls.
         Respects foreground object occlusion so decor/doors/windows remain on top.
@@ -301,27 +337,41 @@ class WallEngine:
         except Exception:
             return room_bgr
 
-        # 2. Extract Vertical Ambient Lighting & Shadow Map
-        gray = cv2.cvtColor(room_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        blur_k = int(W * 0.06) | 1
-        gray_blurred = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
+        # 2. Lighting & Shadow Modulation
+        if luminance_map is not None:
+            # Physically grounded luminance modulation: result = tile_texture * (0.4 + 0.6 * luminance_map)
+            amb_mod = 0.40 + 0.60 * luminance_map[..., None]
+            material_lit = warped.astype(np.float32) * amb_mod
 
-        wall_px = gray_blurred[mask_bool]
-        if len(wall_px) > 0:
-            white_pt = float(np.percentile(wall_px, 92))
-            shadow_map = np.clip(gray_blurred / max(white_pt, 1.0), 0.0, 1.0)
-            shadow_map = np.clip(0.65 * shadow_map + 0.35, 0.0, 1.0)
+            # Contact shadows for wall-mounted objects (clothes, whiteboard, etc.)
+            if contact_shadow_map is not None and contact_footprint is not None and np.any(contact_footprint > 0.01):
+                fp = contact_footprint[..., None]
+                c_mod = 0.25 + 0.75 * contact_shadow_map[..., None]
+                contact_blended = warped.astype(np.float32) * c_mod
+                material_lit = material_lit * (1.0 - fp) + contact_blended * fp
         else:
-            shadow_map = np.ones((H, W), dtype=np.float32)
+            gray = cv2.cvtColor(room_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            blur_k = int(W * 0.06) | 1
+            gray_blurred = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
 
-        # Lighting multiplier
-        light_gain = (1.0 - shadow_strength) + shadow_strength * shadow_map
-        material_lit = warped.astype(np.float32) * light_gain[:, :, None]
+            wall_px = gray_blurred[mask_bool]
+            if len(wall_px) > 0:
+                white_pt = float(np.percentile(wall_px, 92))
+                shadow_map = np.clip(gray_blurred / max(white_pt, 1.0), 0.0, 1.0)
+                shadow_map = np.clip(0.65 * shadow_map + 0.35, 0.0, 1.0)
+            else:
+                shadow_map = np.ones((H, W), dtype=np.float32)
 
-        # Specular Highlight for Glossy/Polished Marble Walls
+            light_gain = (1.0 - shadow_strength) + shadow_strength * shadow_map
+            material_lit = warped.astype(np.float32) * light_gain[:, :, None]
+
+        # Specular Highlight for Glossy/Polished Marble Walls (Pure luminous highlight, NOT old wall pattern)
         if finish in ("glossy", "polished"):
-            specular = np.clip((shadow_map - 0.78) / 0.22, 0.0, 1.0)
-            material_lit = material_lit * (1.0 - 0.15 * specular[:, :, None]) + room_bgr.astype(np.float32) * (0.15 * specular[:, :, None])
+            ref_map = luminance_map if luminance_map is not None else (cv2.cvtColor(room_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0)
+            specular = np.clip((ref_map - 0.78) / 0.22, 0.0, 1.0)[:, :, None]
+            sheen = 0.16 * specular
+            highlight = np.array([255.0, 255.0, 255.0], dtype=np.float32)
+            material_lit = material_lit * (1.0 - sheen) + highlight * sheen
 
         # 3. Crisp Anti-Aliased Edge Feathering Blend (3x3)
         alpha_mask = cv2.GaussianBlur(mask_bool.astype(np.float32), (3, 3), 0)[:, :, None]
@@ -343,38 +393,163 @@ class WallEngine:
 
     def estimate_room_metrics(self, floor_quad, wall_mask, W, H, ppm=200.0):
         """
-        Calculates metric room dimensions, gross & net square footage, and tile estimates.
+        Estimates real-world room metrics including floor area (sq meters), perimeter,
+        wall area, and recommends tile box quantities with 10% wastage.
         """
-        ppm_val = float(ppm) if ppm and ppm > 1.0 else (W / 4.5)
+        if floor_quad is None or len(floor_quad) != 4:
+            return {}
 
-        # Floor dimensions
-        if floor_quad and len(floor_quad) >= 4:
-            fq = np.array(floor_quad, dtype=np.float32)
-            w_px = float((np.hypot(*(fq[1] - fq[0])) + np.hypot(*(fq[2] - fq[3]))) / 2.0)
-            d_px = float((np.hypot(*(fq[3] - fq[0])) + np.hypot(*(fq[2] - fq[1]))) / 2.0)
-        else:
-            w_px, d_px = W * 0.8, H * 0.5
+        pts = np.array(floor_quad, dtype=np.float32)
+        # 2D polygon area in pixel space
+        px_area = 0.5 * np.abs(np.dot(pts[:, 0], np.roll(pts[:, 1], 1)) - np.dot(pts[:, 1], np.roll(pts[:, 0], 1)))
+        
+        # Scale to real-world metric meters
+        area_m2 = max(1.0, float(px_area / (ppm * ppm)))
+        perimeter_m = float(cv2.arcLength(pts, True) / ppm)
 
-        w_m = max(2.5, w_px / ppm_val)
-        d_m = max(2.5, d_px / ppm_val)
-        h_m = 2.85  # Standard residential ceiling height in meters
+        wall_px_count = int(np.count_nonzero(wall_mask)) if wall_mask is not None else 0
+        wall_area_m2 = float(wall_px_count / (ppm * ppm)) if wall_px_count > 0 else (perimeter_m * 2.8 * 0.6)
 
-        w_ft = round(w_m * 3.28084, 1)
-        d_ft = round(d_m * 3.28084, 1)
-        h_ft = round(h_m * 3.28084, 1)
-
-        floor_sqft = round(w_ft * d_ft, 1)
-        perimeter_ft = 2 * (w_ft + d_ft)
-        gross_wall_sqft = round(perimeter_ft * h_ft, 1)
-        net_wall_sqft = round(gross_wall_sqft * 0.72, 1)  # average 28% openings
+        tile_size_m2 = 0.6 * 0.6 # standard 600x600mm
+        floor_tiles_needed = int(np.ceil((area_m2 * 1.10) / tile_size_m2))
+        wall_tiles_needed = int(np.ceil((wall_area_m2 * 1.10) / tile_size_m2))
 
         return {
-            "width_ft": w_ft,
-            "depth_ft": d_ft,
-            "height_ft": h_ft,
-            "floor_sqft": floor_sqft,
-            "gross_wall_sqft": gross_wall_sqft,
-            "net_wall_sqft": net_wall_sqft,
-            "floor_tiles_600x600": int(np.ceil(floor_sqft / 3.875 * 1.10)), # +10% cuts
-            "wall_tiles_300x600": int(np.ceil(net_wall_sqft / 1.937 * 1.10))
+            "floor_area_m2": round(area_m2, 2),
+            "wall_area_m2": round(wall_area_m2, 2),
+            "perimeter_m": round(perimeter_m, 2),
+            "floor_boxes_needed": int(np.ceil(floor_tiles_needed / 4)),
+            "wall_boxes_needed": int(np.ceil(wall_tiles_needed / 4)),
+            "recommended_wastage_pct": 10
         }
+
+    def generate_skirting_strip(self, image_bgr, floor_mask, wall_mask, ppm=200.0, height_cm=10.0, material="mdf_dark_grey", luminance_map=None, seg_map=None, has_floor=True):
+        """
+        Inserts a perspective-aligned skirting board (baseboard) along the floor-wall boundary contour.
+        - Height: 8-12 cm scaled via door reference (ppm) with perspective depth tapering
+        - Material: Matte dark grey MDF with top bullnose bevel highlight
+        - Contact shadows: 1-2px soft-edged shadow directly above on wall side, and below on floor side.
+        - Multiply-blends original room luminance so skirting reacts naturally to lighting.
+        - Strictly shields structural objects (door, bed, box, window, hanging clothes) to guarantee 0px diff.
+        - Strictly shields floor pixels: skirting board sits on the wall base and NEVER cuts into floor.
+        - If has_floor is False (only wall tiles applied), floor is strictly 100% untouched.
+        """
+        H, W = image_bgr.shape[:2]
+        if floor_mask is None or not np.any(floor_mask > 0) or wall_mask is None or not np.any(wall_mask > 0):
+            return image_bgr, np.zeros((H, W), dtype=bool)
+
+        ppm_val = float(ppm) if ppm and ppm > 1.0 else (W / 4.5)
+        strip_h = max(6, int(round((float(height_cm) / 100.0) * ppm_val)))
+
+        fm_u8 = (floor_mask > 0).astype(np.uint8)
+        wm_u8 = (wall_mask > 0).astype(np.uint8)
+
+        # 1. Contact interface strictly where wall directly meets floor
+        dil_fm = cv2.dilate(fm_u8, np.ones((5, 5), np.uint8))
+        contact = (dil_fm > 0) & (wm_u8 > 0)
+
+        ys_c, xs_c = np.where(contact)
+        if len(xs_c) < 10:
+            return image_bgr, np.zeros((H, W), dtype=bool)
+
+        # Per-column contact point (the bottom edge of the wall meeting the floor)
+        col_pts = {}
+        for x, y in zip(xs_c, ys_c):
+            if x not in col_pts or y > col_pts[x]:
+                col_pts[x] = y
+
+        contact_cols = np.array(sorted(col_pts.keys()))
+        contact_ys = np.array([col_pts[c] for c in contact_cols], dtype=np.float32)
+
+        # Baseline fitted strictly to the true wall-floor contact zone
+        if len(contact_cols) >= 5:
+            m_base, c_base = np.polyfit(contact_cols, contact_ys, 1)
+        else:
+            m_base, c_base = 0.0, float(contact_ys[0])
+
+        span_min = int(contact_cols.min())
+        span_max = int(contact_cols.max())
+        span_cols = np.arange(span_min, span_max + 1)
+        y_fit = m_base * span_cols + c_base
+
+        y_min = float(np.min(y_fit))
+        y_max = float(np.max(y_fit))
+
+        # Build skirting polygon strip with perspective depth scaling
+        skirting_mask = np.zeros((H, W), dtype=np.uint8)
+        bevel_mask = np.zeros((H, W), dtype=np.uint8)
+
+        for idx_c, c in enumerate(span_cols):
+            y_base = int(round(y_fit[idx_c]))
+            if y_base < 0 or y_base >= H or c < 0 or c >= W:
+                continue
+            depth_scale = 0.70 + 0.30 * (float(y_base) - y_min) / max(1.0, y_max - y_min)
+            col_strip_h = max(5, int(round(strip_h * depth_scale)))
+
+            # Sits at bottom of wall, rising up into the wall
+            y_bot = y_base
+            y_top = max(0, y_bot - col_strip_h)
+
+            skirting_mask[y_top:y_bot + 1, c] = 255
+            bevel_mask[y_top:min(y_top + 2, y_bot), c] = 255
+
+        # Horizontal closure for architectural continuity
+        skirting_mask = cv2.morphologyEx(skirting_mask, cv2.MORPH_CLOSE, np.ones((3, 7), np.uint8))
+        bevel_mask = cv2.bitwise_and(bevel_mask, skirting_mask)
+
+        # STRICT ARCHITECTURAL FLOOR PROTECTION:
+        # A skirting board is an architectural wall element attached to the base of the wall.
+        # It strictly never overwrites floor pixels!
+        skirting_mask[fm_u8 > 0] = 0
+        bevel_mask[fm_u8 > 0] = 0
+
+        # Structural protection shield (door, bed, box, clothes, window)
+        structural_shield = None
+        if seg_map is not None:
+            structural_shield = np.isin(seg_map, [7, 8, 9, 14, 22, 41, 92, 100, 111, 115, 127, 138, 142])
+            skirting_mask[structural_shield] = 0
+            bevel_mask[structural_shield] = 0
+
+        # 1. Base Material: Matte dark grey MDF skirting (BGR: 44, 46, 48)
+        skirting_canvas = np.zeros_like(image_bgr, dtype=np.float32)
+        skirting_canvas[:] = (44.0, 46.0, 48.0)
+        skirting_canvas[bevel_mask > 0] = (78.0, 80.0, 84.0)
+
+        # 2. Modulate with room luminance if provided
+        if luminance_map is not None:
+            lum_mod = 0.40 + 0.60 * luminance_map[..., None]
+            skirting_canvas = skirting_canvas * lum_mod
+
+        # 3. Contact shadows:
+        # Above strip on wall side (always applies if wall is active)
+        top_dil = cv2.dilate(skirting_mask, np.ones((3, 3), np.uint8))
+        top_shadow_zone = ((top_dil > 0) & (skirting_mask == 0) & (wm_u8 > 0)).astype(np.float32)
+
+        # Below strip on floor side:
+        # ONLY applies if new floor material was applied (has_floor is True)!
+        # If user only applied wall tiles, floor must remain 100% bit-exact untouched!
+        if has_floor:
+            bot_dil = cv2.dilate(skirting_mask, np.ones((3, 3), np.uint8))
+            bot_shadow_zone = ((bot_dil > 0) & (skirting_mask == 0) & (fm_u8 > 0)).astype(np.float32)
+        else:
+            bot_shadow_zone = np.zeros((H, W), dtype=np.float32)
+
+        if structural_shield is not None:
+            top_shadow_zone[structural_shield] = 0.0
+            bot_shadow_zone[structural_shield] = 0.0
+
+        top_shadow_blur = cv2.GaussianBlur(top_shadow_zone, (3, 3), 0)
+        bot_shadow_blur = cv2.GaussianBlur(bot_shadow_zone, (3, 3), 0)
+
+        out_img = image_bgr.astype(np.float32).copy()
+        out_img = out_img * (1.0 - 0.28 * top_shadow_blur[..., None])
+        if has_floor:
+            out_img = out_img * (1.0 - 0.32 * bot_shadow_blur[..., None])
+
+        strip_alpha = (skirting_mask > 0).astype(np.float32)[..., None]
+        out_img = skirting_canvas * strip_alpha + out_img * (1.0 - strip_alpha)
+
+        if structural_shield is not None:
+            out_img[structural_shield] = image_bgr[structural_shield]
+
+        return np.clip(out_img, 0, 255).astype(np.uint8), (skirting_mask > 0)

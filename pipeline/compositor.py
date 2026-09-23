@@ -9,35 +9,57 @@ class VisualizerCompositor:
     def __init__(self):
         pass
 
-    def composite(self, room_bgr, warped_material, floor_mask, lighting_map, shadow_strength=0.55, finish="satin", ao_map=None, fg_alpha=None, specular_map=None):
+    def composite(self, room_bgr, warped_material, floor_mask, lighting_map=None, shadow_strength=0.55, finish="satin", ao_map=None, fg_alpha=None, specular_map=None, luminance_map=None, contact_shadow_map=None, contact_footprint=None):
         """
         Blends the perspective-warped material into the room photograph with physically plausible lighting,
-        contact AO shadows, natural specular reflections, and strict foreground object occlusion shield.
+        luminance modulation (0.4 + 0.6 * luminance_map), contact shadow recreation, natural specular reflections,
+        and strict foreground object occlusion shield.
         """
         H, W = room_bgr.shape[:2]
 
-        # 1. Combine Ambient Lighting Map and Contact AO
-        combined_lighting = lighting_map.copy()
-        if ao_map is not None:
-            combined_lighting = combined_lighting * ao_map
+        if luminance_map is not None:
+            # Physically grounded luminance modulation: result = tile_texture * (0.4 + 0.6 * luminance_map)
+            amb_mod = 0.40 + 0.60 * luminance_map[..., None]
+            material_lit = warped_material.astype(np.float32) * amb_mod
 
-        # 2. Apply Lighting & Shadows to Warped Material
-        effective_shadow = (1.0 - shadow_strength) + shadow_strength * combined_lighting
-        material_lit = warped_material.astype(np.float32) * effective_shadow[:, :, None]
+            # Object contact shadows (bed, boxes, footwear) multiply-blended at 0.75 strength
+            if contact_shadow_map is not None and contact_footprint is not None and np.any(contact_footprint > 0.01):
+                fp = contact_footprint[..., None]
+                c_mod = 0.25 + 0.75 * contact_shadow_map[..., None]
+                contact_blended = warped_material.astype(np.float32) * c_mod
+                material_lit = material_lit * (1.0 - fp) + contact_blended * fp
+
+            if ao_map is not None:
+                material_lit = material_lit * ao_map[:, :, None]
+
+            combined_lighting = luminance_map
+        else:
+            # 1. Combine Ambient Lighting Map and Contact AO
+            combined_lighting = lighting_map.copy() if lighting_map is not None else np.ones((H, W), dtype=np.float32)
+            if ao_map is not None:
+                combined_lighting = combined_lighting * ao_map
+
+            # 2. Apply Lighting & Shadows to Warped Material
+            effective_shadow = (1.0 - shadow_strength) + shadow_strength * combined_lighting
+            material_lit = warped_material.astype(np.float32) * effective_shadow[:, :, None]
 
         # 3. Specular Response & Natural Reflection Modulation
+        # Pure light sheen highlight reflecting ambient light sources (NOT old tile pattern!)
+        highlight = np.array([255.0, 255.0, 255.0], dtype=np.float32)
         if finish in ("glossy", "polished"):
             if specular_map is not None:
                 spec = specular_map[:, :, None]
             else:
                 spec = np.clip((combined_lighting - 0.75) / 0.25, 0.0, 1.0)[:, :, None]
-            material_lit = material_lit * (1.0 - 0.24 * spec) + room_bgr.astype(np.float32) * (0.24 * spec)
+            sheen = 0.22 * spec
+            material_lit = material_lit * (1.0 - sheen) + highlight * sheen
         elif finish == "satin":
             if specular_map is not None:
                 spec = specular_map[:, :, None]
             else:
                 spec = np.clip((combined_lighting - 0.82) / 0.18, 0.0, 1.0)[:, :, None]
-            material_lit = material_lit * (1.0 - 0.12 * spec) + room_bgr.astype(np.float32) * (0.12 * spec)
+            sheen = 0.10 * spec
+            material_lit = material_lit * (1.0 - sheen) + highlight * sheen
 
         # 4. Crisp Anti-Aliased Edge Feathering Blend (3x3)
         alpha_mask = cv2.GaussianBlur(floor_mask.astype(np.float32), (3, 3), 0)[:, :, None]

@@ -33,9 +33,10 @@ class RoomVisualizerPipeline:
         self.compositor = VisualizerCompositor()
         self.wall_engine = WallEngine()
 
-    def process_room(self, image_bgr, tile_bgr=None, tile_config=None, generate_debug=False):
+    def process_room(self, image_bgr, tile_bgr=None, tile_config=None, wall_tile_bgr=None, wall_tile_config=None, generate_debug=False):
         """
         Executes the complete multi-stage pipeline on a room image.
+        Supports simultaneous or independent Floor and Wall photorealistic surface synthesis.
         Returns:
           - 'clean_mask': Final refined boolean floor mask (H, W)
           - 'clean_wall_mask': Final refined boolean wall mask (H, W)
@@ -44,7 +45,7 @@ class RoomVisualizerPipeline:
           - 'wall_planes': Partitioned physical wall planes
           - 'room_metrics': Estimated dimensions, sqft, and tile count
           - 'depth_map': Monocular depth map
-          - 'result_bgr': Composite result if tile_bgr is provided
+          - 'result_bgr': Composite result if floor or wall tile is provided
           - 'debug_stages': Dictionary of visual debug stage images
         """
         H, W = image_bgr.shape[:2]
@@ -97,7 +98,7 @@ class RoomVisualizerPipeline:
         )
 
         # Stage 8: 3D Multi-Plane Wall Segmentation & Coordinated Room-Box Geometry
-        clean_wall_mask = self.wall_engine.extract_wall_mask(seg_map, floor_mask=final_floor_mask, depth_map=depth_map)
+        clean_wall_mask = self.wall_engine.extract_wall_mask(seg_map, floor_mask=final_floor_mask, depth_map=depth_map, image_bgr=image_bgr)
         room_box = self.perspective_engine.compute_room_box_geometry(floor_quad, clean_wall_mask, W, H)
         wall_planes = self.wall_engine.partition_wall_planes(clean_wall_mask, depth_map, W, H, floor_quad=floor_quad, room_box=room_box)
         wall_quads = [p["quad"] for p in wall_planes] if wall_planes else [room_box["back_wall_quad"]]
@@ -114,89 +115,153 @@ class RoomVisualizerPipeline:
         # Room Dimension & Material Estimation
         room_metrics = self.wall_engine.estimate_room_metrics(floor_quad, clean_wall_mask, W, H)
 
-        # Stage 8b: Suppress and smoothly blur small unidentified clutter on floor and walls
+        # Determine target surfaces
+        has_floor = (tile_bgr is not None and (tile_config or {}).get("target_surface", "floor") != "wall")
+        w_tile = wall_tile_bgr if wall_tile_bgr is not None else (tile_bgr if (tile_config or {}).get("target_surface") == "wall" else None)
+        w_cfg = wall_tile_config if wall_tile_config is not None else (tile_config if (tile_config or {}).get("target_surface") == "wall" else {})
+        has_wall = (w_tile is not None and np.any(clean_wall_mask))
+
+        # Stage 8b: Suppress and smoothly blur small unidentified clutter on active surfaces only
         cleaned_image_bgr, clutter_mask = self.occlusion_detector.suppress_and_blur_clutter(
             image_bgr=image_bgr,
             seg_map=seg_map,
-            floor_mask=final_floor_mask,
-            wall_mask=clean_wall_mask
+            floor_mask=final_floor_mask if has_floor else None,
+            wall_mask=clean_wall_mask if has_wall else None
         )
 
+        # Surface Synthesis & Compositing
         result_bgr = None
-        if tile_bgr is not None:
-            cfg = tile_config or {}
-            target_surface = cfg.get("target_surface", "floor") # 'floor' or 'wall'
-            pattern = cfg.get("pattern", "grid")
-            grout_w = cfg.get("grout_width", 0)
-            grout_col = cfg.get("grout_color", (200, 200, 200))
-            tile_scale = cfg.get("scale", 1.0)
-            tw_mm = cfg.get("tile_width_mm", 600.0)
-            th_mm = cfg.get("tile_height_mm", 600.0)
-            ppm = cfg.get("pixels_per_meter", 200.0)
-            shadow_strength = cfg.get("shadow_strength", 0.55)
-            finish = cfg.get("finish", "satin")
+        composite_canvas = cleaned_image_bgr.copy()
 
-            slab = bool(cfg.get("slab", False))
+        # Extract Ambient Luminance & Contact Shadow Maps from Original Photo
+        lum_map = self.lighting_engine.extract_ambient_luminance(image_bgr)
+        contact_sh = self.lighting_engine.extract_contact_shadow(image_bgr)
+        floor_footprint = self.lighting_engine.extract_furniture_footprint(seg_map, final_floor_mask, is_wall=False, max_dist=12)
+        wall_footprint = self.lighting_engine.extract_furniture_footprint(seg_map, clean_wall_mask, is_wall=True, max_dist=10)
 
-            if target_surface == "wall" and np.any(clean_wall_mask):
-                # Apply wall material across coordinated wall planes
-                comp_wall = cleaned_image_bgr.copy()
-                for plane in (wall_planes or [{"mask": clean_wall_mask, "quad": wall_quads[0]}]):
-                    p_mask = plane["mask"]
-                    p_quad = plane["quad"]
-                    tx, ty, pw, ph = self.perspective_engine.plan_tiling(
-                        floor_quad=p_quad, W=W, H=H, ppm=ppm,
-                        tile_w_mm=tw_mm, tile_h_mm=th_mm, tile_scale=tile_scale,
-                        is_wall=True
-                    )
-                    flat_surf = self.perspective_engine.build_surface(
-                        tile_bgr=tile_bgr, pw=pw, ph=ph, tx=tx, ty=ty,
-                        pattern=pattern, grout_w=grout_w, grout_col=grout_col,
-                        slab=slab
-                    )
-                    comp_wall = self.wall_engine.warp_wall_material(
-                        room_bgr=comp_wall,
-                        tile_surface=flat_surf,
-                        dest_quad=p_quad,
-                        mask_bool=p_mask,
-                        shadow_strength=shadow_strength,
-                        finish=finish,
-                        fg_alpha=fg_alpha
-                    )
-                result_bgr = comp_wall
-            else:
-                # Apply floor material with ambient illumination, specular reflections & Contact AO shadows
-                tx, ty, pw, ph = self.perspective_engine.plan_tiling(
-                    floor_quad=floor_quad, W=W, H=H, ppm=ppm,
-                    tile_w_mm=tw_mm, tile_h_mm=th_mm, tile_scale=tile_scale,
-                    is_wall=False
+        # 1. Floor Surface Synthesis
+        f_ppm = 200.0
+        if has_floor:
+            f_cfg = tile_config or {}
+            f_pattern = f_cfg.get("pattern", "grid")
+            f_gw = f_cfg.get("grout_width", 0)
+            f_gc = f_cfg.get("grout_color", (200, 200, 200))
+            f_scale = f_cfg.get("scale", 1.0)
+            f_tw = f_cfg.get("tile_width_mm", 600.0)
+            f_th = f_cfg.get("tile_height_mm", 600.0)
+            f_ppm = f_cfg.get("pixels_per_meter", 200.0)
+            f_shadow = f_cfg.get("shadow_strength", 0.55)
+            f_finish = f_cfg.get("finish", "satin")
+            f_slab = bool(f_cfg.get("slab", False))
+
+            f_tx, f_ty, f_pw, f_ph = self.perspective_engine.plan_tiling(
+                floor_quad=floor_quad, W=W, H=H, ppm=f_ppm,
+                tile_w_mm=f_tw, tile_h_mm=f_th, tile_scale=f_scale,
+                is_wall=False
+            )
+            flat_floor = self.perspective_engine.build_surface(
+                tile_bgr=tile_bgr, pw=f_pw, ph=f_ph, tx=f_tx, ty=f_ty,
+                pattern=f_pattern, grout_w=f_gw, grout_col=f_gc,
+                slab=f_slab
+            )
+            warped_floor = self.perspective_engine.warp_to_quad(flat_floor, floor_quad, W, H)
+            if generate_debug:
+                debug_stages["8_warped_flooring"] = warped_floor.copy()
+
+            lighting_map = self.lighting_engine.extract_lighting_map(composite_canvas, final_floor_mask)
+            ao_map = self.lighting_engine.compute_contact_ao(final_floor_mask, obstacle_mask)
+            specular_map = self.lighting_engine.extract_specular_map(composite_canvas, final_floor_mask)
+
+            composite_canvas = self.compositor.composite(
+                room_bgr=composite_canvas,
+                warped_material=warped_floor,
+                floor_mask=final_floor_mask,
+                lighting_map=lighting_map,
+                shadow_strength=f_shadow,
+                finish=f_finish,
+                ao_map=ao_map,
+                fg_alpha=fg_alpha,
+                specular_map=specular_map,
+                luminance_map=lum_map,
+                contact_shadow_map=contact_sh,
+                contact_footprint=floor_footprint
+            )
+            result_bgr = composite_canvas
+
+        # 2. Wall Surface Synthesis
+        w_tile = wall_tile_bgr if wall_tile_bgr is not None else (tile_bgr if (tile_config or {}).get("target_surface") == "wall" else None)
+        w_cfg = wall_tile_config if wall_tile_config is not None else (tile_config if (tile_config or {}).get("target_surface") == "wall" else {})
+
+        has_wall = False
+        if w_tile is not None and np.any(clean_wall_mask):
+            has_wall = True
+            w_pattern = w_cfg.get("pattern", "grid")
+            w_gw = w_cfg.get("grout_width", 0)
+            w_gc = w_cfg.get("grout_color", (200, 200, 200))
+            w_scale = w_cfg.get("scale", 1.0)
+            w_tw = w_cfg.get("tile_width_mm", 600.0)
+            w_th = w_cfg.get("tile_height_mm", 600.0)
+            w_ppm = w_cfg.get("pixels_per_meter", 200.0)
+            w_shadow = w_cfg.get("shadow_strength", 0.55)
+            w_finish = w_cfg.get("finish", "satin")
+            w_slab = bool(w_cfg.get("slab", False))
+
+            for plane in (wall_planes or [{"mask": clean_wall_mask, "quad": wall_quads[0]}]):
+                p_mask = plane["mask"]
+                p_quad = plane["quad"]
+                w_tx, w_ty, w_pw, w_ph = self.perspective_engine.plan_tiling(
+                    floor_quad=p_quad, W=W, H=H, ppm=w_ppm,
+                    tile_w_mm=w_tw, tile_h_mm=w_th, tile_scale=w_scale,
+                    is_wall=True
                 )
-                flat_surface = self.perspective_engine.build_surface(
-                    tile_bgr=tile_bgr, pw=pw, ph=ph, tx=tx, ty=ty,
-                    pattern=pattern, grout_w=grout_w, grout_col=grout_col,
-                    slab=slab
+                flat_wall = self.perspective_engine.build_surface(
+                    tile_bgr=w_tile, pw=w_pw, ph=w_ph, tx=w_tx, ty=w_ty,
+                    pattern=w_pattern, grout_w=w_gw, grout_col=w_gc,
+                    slab=w_slab
                 )
-                warped_material = self.perspective_engine.warp_to_quad(flat_surface, floor_quad, W, H)
-                if generate_debug:
-                    debug_stages["8_warped_flooring"] = warped_material.copy()
-
-                lighting_map = self.lighting_engine.extract_lighting_map(cleaned_image_bgr, final_floor_mask)
-                ao_map = self.lighting_engine.compute_contact_ao(final_floor_mask, obstacle_mask)
-                specular_map = self.lighting_engine.extract_specular_map(cleaned_image_bgr, final_floor_mask)
-
-                result_bgr = self.compositor.composite(
-                    room_bgr=cleaned_image_bgr,
-                    warped_material=warped_material,
-                    floor_mask=final_floor_mask,
-                    lighting_map=lighting_map,
-                    shadow_strength=shadow_strength,
-                    finish=finish,
-                    ao_map=ao_map,
+                composite_canvas = self.wall_engine.warp_wall_material(
+                    room_bgr=composite_canvas,
+                    tile_surface=flat_wall,
+                    dest_quad=p_quad,
+                    mask_bool=p_mask,
+                    shadow_strength=w_shadow,
+                    finish=w_finish,
                     fg_alpha=fg_alpha,
-                    specular_map=specular_map
+                    luminance_map=lum_map,
+                    contact_shadow_map=contact_sh,
+                    contact_footprint=wall_footprint
                 )
-                if generate_debug:
-                    debug_stages["9_final_composite"] = result_bgr.copy()
+            result_bgr = composite_canvas
+
+        # 3. Wall-Floor Transition Strip (Skirting Board)
+        if has_floor or has_wall:
+            composite_canvas, skirting_mask = self.wall_engine.generate_skirting_strip(
+                composite_canvas,
+                floor_mask=final_floor_mask,
+                wall_mask=clean_wall_mask,
+                ppm=f_ppm,
+                height_cm=10.0,
+                material="mdf_dark_grey",
+                luminance_map=lum_map,
+                seg_map=seg_map,
+                has_floor=has_floor
+            )
+            # Re-apply foreground alpha matte to strictly guarantee occluding furniture sits in front of skirting
+            if fg_alpha is not None:
+                fg_a = fg_alpha[:, :, None] if fg_alpha.ndim == 2 else fg_alpha
+                composite_canvas = composite_canvas * (1.0 - fg_a) + image_bgr.astype(np.float32) * fg_a
+                composite_canvas = np.clip(composite_canvas, 0, 255).astype(np.uint8)
+
+            # Strict preservation invariant: If surface was not targeted, keep original pixels bit-exact
+            if not has_floor and final_floor_mask is not None:
+                composite_canvas[final_floor_mask] = image_bgr[final_floor_mask]
+            if not has_wall and clean_wall_mask is not None:
+                composite_canvas[clean_wall_mask] = image_bgr[clean_wall_mask]
+
+            result_bgr = composite_canvas
+
+        if generate_debug and result_bgr is not None:
+            debug_stages["9_final_composite"] = result_bgr.copy()
 
         return {
             "seg_map": seg_map,

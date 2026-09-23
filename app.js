@@ -1283,7 +1283,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 const wallTileBlob = await imageToBlob(imageCache.wallTileImage);
                 if (wallTileBlob) {
                     fd.append('wall_tile', wallTileBlob, 'wall_tile.jpg');
-                    fd.append('wall_mask', cachedWallMaskBlob, 'wall_mask.png');
                     fd.append('wall_scale', visualizerState.wallScale !== undefined ? visualizerState.wallScale : visualizerState.scale);
                     fd.append('wall_rotation', visualizerState.wallRotation !== undefined ? visualizerState.wallRotation : 0);
                     fd.append('wall_brightness', visualizerState.wallBrightness !== undefined ? visualizerState.wallBrightness : 1.0);
@@ -1298,6 +1297,7 @@ document.addEventListener('DOMContentLoaded', () => {
             
             if (cachedFloorMaskBlob) fd.append('floor_mask', cachedFloorMaskBlob, 'floor_mask.png');
             if (cachedFloorFgBlob)   fd.append('floor_fg_mask', cachedFloorFgBlob, 'floor_fg.png');
+            if (cachedWallMaskBlob)  fd.append('wall_mask', cachedWallMaskBlob, 'wall_mask.png');
             fd.append('floor_quad',  JSON.stringify(visualizerState.floorQuad));
             fd.append('pixels_per_meter', visualizerState.pixelsPerMeter || 0);
             
@@ -2052,33 +2052,62 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
-    // "↺ Default" — restore the current surface's layout settings to factory
+    // "↺ Default" — restore default settings for all layouts (Floor & Wall) without removing applied materials
     const LAYOUT_DEFAULTS = {
         scale: 0.18, rotation: 0, brightness: 1.0, shadowStrength: 0.55,
         pattern: 'grid', groutWidth: 0, groutColor: '#ffffff', finish: 'matte', slab: 0,
     };
-    function resetCurrentLayout() {
-        const isFloor = visualizerState.target === 'floor';
+    function resetAllLayouts() {
         const d = LAYOUT_DEFAULTS;
-        if (isFloor) {
-            visualizerState.scale = d.scale; visualizerState.rotation = d.rotation;
-            visualizerState.brightness = d.brightness; visualizerState.shadowStrength = d.shadowStrength;
-            visualizerState.pattern = d.pattern; visualizerState.groutWidth = d.groutWidth;
-            visualizerState.groutColor = d.groutColor; visualizerState.finish = d.finish;
-            visualizerState.slab = d.slab; visualizerState.tilesX = 6; visualizerState.tilesY = 5;
-        } else {
-            visualizerState.wallScale = d.scale; visualizerState.wallRotation = d.rotation;
-            visualizerState.wallBrightness = d.brightness; visualizerState.wallShadowStrength = d.shadowStrength;
-            visualizerState.wallPattern = d.pattern; visualizerState.wallGroutWidth = d.groutWidth;
-            visualizerState.wallGroutColor = d.groutColor; visualizerState.wallFinish = d.finish;
-            visualizerState.wallSlab = d.slab; visualizerState.wallTilesX = 5; visualizerState.wallTilesY = 7;
-        }
+
+        // 1. Reset Floor layout settings
+        visualizerState.scale = d.scale;
+        visualizerState.rotation = d.rotation;
+        visualizerState.brightness = d.brightness;
+        visualizerState.shadowStrength = d.shadowStrength;
+        visualizerState.pattern = d.pattern;
+        visualizerState.groutWidth = d.groutWidth;
+        visualizerState.groutColor = d.groutColor;
+        visualizerState.finish = d.finish;
+        visualizerState.slab = d.slab;
+        visualizerState.tilesX = 6;
+        visualizerState.tilesY = 5;
+
+        // 2. Reset Wall layout settings
+        visualizerState.wallScale = d.scale;
+        visualizerState.wallRotation = d.rotation;
+        visualizerState.wallBrightness = d.brightness;
+        visualizerState.wallShadowStrength = d.shadowStrength;
+        visualizerState.wallPattern = d.pattern;
+        visualizerState.wallGroutWidth = d.groutWidth;
+        visualizerState.wallGroutColor = d.groutColor;
+        visualizerState.wallFinish = d.finish;
+        visualizerState.wallSlab = d.slab;
+        visualizerState.wallTilesX = 5;
+        visualizerState.wallTilesY = 7;
+
+        // 3. Reset UI slider controls to default
+        if (scaleSlider) scaleSlider.value = d.scale;
+        if (scaleVal) scaleVal.textContent = 'Default';
+        if (rotSlider) rotSlider.value = d.rotation;
+        if (rotVal) rotVal.textContent = '0°';
         if (brightSlider) brightSlider.value = 100;
+        if (brightVal) brightVal.textContent = '100%';
         if (shadowSlider) shadowSlider.value = 55;
+        if (shadowVal) shadowVal.textContent = '55%';
+        if (groutWidthSlider) groutWidthSlider.value = 0;
+        if (groutWidthVal) groutWidthVal.textContent = 'None';
+
+        // 4. Synchronize UI indicators and panels
         syncSlidersUI();
-        updateCoveragePanel();
+        if (typeof updateCoveragePanel === 'function') updateCoveragePanel();
+        if (typeof updateCostCalculator === 'function') updateCostCalculator();
+        if (typeof updateCostEstimator === 'function') updateCostEstimator();
+
+        // 5. Re-render visualizer with current tiles strictly preserved
         debouncedVisualize(120);
     }
+    const resetCurrentLayout = resetAllLayouts;
     // Unified Reset Function: Restores raw original room photo and removes all custom floor/wall tiles
     function resetToOriginalRoom() {
         // 1. Cancel in-flight renders and debounce timers
@@ -2178,8 +2207,10 @@ document.addEventListener('DOMContentLoaded', () => {
     if (btnCatalogReset) btnCatalogReset.addEventListener('click', resetToOriginalRoom);
 
     const resetLayoutBtn = document.getElementById('reset-layout-btn');
-    if (resetLayoutBtn) resetLayoutBtn.addEventListener('click', resetToOriginalRoom);
+    if (resetLayoutBtn) resetLayoutBtn.addEventListener('click', resetAllLayouts);
 
+    window.resetAllLayouts = resetAllLayouts;
+    window.resetCurrentLayout = resetAllLayouts;
     window.resetToOriginalRoom = resetToOriginalRoom;
 
     // Unified Surface Switcher (Synchronizes both Materials and Layout tabs)

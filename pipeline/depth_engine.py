@@ -181,7 +181,7 @@ class DepthGeometryEngine:
     def visualize_plane(self, image_bgr, plane_info, rough_floor):
         """Visualizes estimated 3D floor plane inliers and bounding quad."""
         vis = image_bgr.copy()
-        if plane_info is not None and "corners_2d" in plane_info:
+        if plane_info is not None and plane_info.get("corners_2d") is not None:
             quad = np.array(plane_info["corners_2d"], dtype=np.int32)
             cv2.polylines(vis, [quad], isClosed=True, color=(255, 0, 0), thickness=3)
             for idx, pt in enumerate(quad):

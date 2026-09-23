@@ -82,10 +82,10 @@ ADE20K_LABELS = {
     141: "crt screen",
 }
 
-# Labels for protected major furniture & structural entities (Bed, Table, Sofa, Armchair, Chair, Cabinet, Door, Painting, Bookcase, Countertop, Bathtub, Sink, Toilet, etc.)
+# Labels for protected major furniture & structural entities (Bed, Table, Sofa, Armchair, Chair, Cabinet, Door, Painting, Bookcase, Countertop, Bathtub, Sink, Toilet, Box, Apparel, etc.)
 FLOOR_OBSTACLE_IDS = {
     7, 10, 14, 15, 17, 18, 19, 22, 23, 24, 27, 30, 31, 33, 35, 36, 37, 39,
-    44, 47, 50, 57, 58, 62, 64, 65, 70, 75, 80, 81, 89, 110, 119, 125, 128, 130, 135, 141
+    41, 44, 47, 50, 57, 58, 62, 64, 65, 70, 75, 80, 81, 89, 92, 100, 110, 111, 115, 119, 125, 127, 128, 130, 135, 138, 141, 142
 }
 
 # Standard real-world reference sizes (in meters)
@@ -780,22 +780,15 @@ def apply_homography_warp(
     M = cv2.getPerspectiveTransform(src_pts, dst_pts)
     warped = cv2.warpPerspective(tile_surface, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
-    # 2. Extract Room Illumination Field
-    gray = cv2.cvtColor(room_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    k_open = max(15, (int(W * 0.025) | 1))
-    open_elem = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_open, k_open))
-    gray_opened = cv2.morphologyEx(gray, cv2.MORPH_OPEN, open_elem)
-
-    blur_k = max(31, (int(W * 0.08) | 1))
-    gray_blurred = cv2.GaussianBlur(gray_opened, (blur_k, blur_k), 0)
-
-    floor_px = gray_blurred[mask_u8 > 0]
-    if len(floor_px) > 0:
-        white_pt = float(np.percentile(floor_px, 94))
-        shadow_map = np.clip(gray_blurred / max(white_pt, 1.0), 0.0, 1.0)
-        shadow_map = np.clip(0.68 * shadow_map + 0.32, 0.32, 1.0)
-    else:
-        shadow_map = np.ones((H, W), dtype=np.float32)
+    # 2. Extract Room Macro Ambient Luminance Field (Stripping old tile seams & textures)
+    gray_u8 = cv2.cvtColor(room_bgr, cv2.COLOR_BGR2GRAY)
+    k_seam = max(9, int(W * 0.02) | 1)
+    elem = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_seam, k_seam))
+    co = cv2.morphologyEx(gray_u8, cv2.MORPH_OPEN, elem)
+    co = cv2.morphologyEx(co, cv2.MORPH_CLOSE, elem)
+    lum_map = cv2.GaussianBlur(co.astype(np.float32) / 255.0, (0, 0), sigmaX=max(25.0, float(W) * 0.035))
+    amb_mod = 0.40 + 0.60 * lum_map[:, :, None]
+    material_lit = warped.astype(np.float32) * amb_mod
 
     # Compute Contact AO from foreground objects and floor perimeter
     ao_map = np.ones((H, W), dtype=np.float32)
@@ -806,11 +799,10 @@ def apply_homography_warp(
         ao_norm = np.clip(dist / 18.0, 0.0, 1.0)
         ao_map = 1.0 - (1.0 - ao_norm) ** 1.8 * 0.42
 
-    combined_lighting = shadow_map * ao_map
-    light_gain = (1.0 - shadow_strength) + shadow_strength * combined_lighting
-    material_lit = warped.astype(np.float32) * light_gain[:, :, None]
+    material_lit = material_lit * ao_map[:, :, None]
 
-    # Specular response & natural reflection modulation from window highlights
+    # Specular response & natural reflection modulation from window highlights (pure light highlight, NOT old tile pattern)
+    gray = gray_u8.astype(np.float32)
     floor_raw_px = gray[mask_u8 > 0]
     if len(floor_raw_px) > 0:
         p80 = float(np.percentile(floor_raw_px, 80))
@@ -821,10 +813,13 @@ def apply_homography_warp(
     else:
         specular = np.zeros((H, W, 1), dtype=np.float32)
 
+    highlight = np.array([255.0, 255.0, 255.0], dtype=np.float32)
     if finish in ("glossy", "polished"):
-        material_lit = material_lit * (1.0 - 0.24 * specular) + room_bgr.astype(np.float32) * (0.24 * specular)
+        sheen = 0.22 * specular
+        material_lit = material_lit * (1.0 - sheen) + highlight * sheen
     elif finish == "satin":
-        material_lit = material_lit * (1.0 - 0.12 * specular) + room_bgr.astype(np.float32) * (0.12 * specular)
+        sheen = 0.10 * specular
+        material_lit = material_lit * (1.0 - sheen) + highlight * sheen
 
     # 3. Crisp Anti-Aliased Edge Feathering Blend (3x3)
     alpha_mask = cv2.GaussianBlur((mask_u8 > 0).astype(np.float32), (3, 3), 0)[:, :, None]
@@ -1132,6 +1127,17 @@ async def visualize_room(
                     fg_alpha=floor_fg_alpha,
                 )
 
+        # Wall Mask & Tiling
+        wm_np = None
+        if wall_mask is not None:
+            try:
+                wm_bytes = await wall_mask.read()
+                if wm_bytes:
+                    wm_pil = Image.open(io.BytesIO(wm_bytes)).convert("L")
+                    wm_np = (np.array(wm_pil) > 10) & (floor_mask_u8 == 0)
+            except Exception as wm_err:
+                print(f"Wall mask parse notice: {wm_err}")
+
         # Apply Wall Tiling
         if wall_tile is not None:
             wt_bytes = await wall_tile.read()
@@ -1139,21 +1145,12 @@ async def visualize_room(
                 wt_pil = Image.open(io.BytesIO(wt_bytes)).convert("RGB")
                 wt_np = np.array(wt_pil)
                 if visualizer_pipeline is not None:
-                    wm_np = None
-                    if wall_mask is not None:
-                        wm_bytes = await wall_mask.read()
-                        if wm_bytes:
-                            wm_pil = Image.open(io.BytesIO(wm_bytes)).convert("L")
-                            wm_np = np.array(wm_pil) > 10
-                    
                     if wm_np is None or not np.any(wm_np):
                         seg_out = visualizer_pipeline.process_room(room_bgr)
                         wm_np = seg_out["clean_wall_mask"]
                         w_quads = seg_out["wall_quads"]
                         w_planes = seg_out["wall_planes"]
                     else:
-                        # Enforce strict mutual exclusivity with floor mask
-                        wm_np = wm_np & (floor_mask_u8 == 0)
                         room_box = visualizer_pipeline.perspective_engine.compute_room_box_geometry(fq, wm_np, W, H)
                         w_planes = visualizer_pipeline.wall_engine.partition_wall_planes(wm_np, None, W, H, floor_quad=fq, room_box=room_box)
                         w_quads = [p["quad"] for p in w_planes] if w_planes else [room_box["back_wall_quad"]]
@@ -1191,6 +1188,31 @@ async def visualize_room(
                                 )
                             except Exception as plane_err:
                                 print(f"Wall plane warp notice: {plane_err}")
+
+        # Apply Wall-Floor Transition Strip (Skirting Board)
+        has_applied_floor = (floor_tile is not None) or (tile is not None and not wall_tile)
+        has_applied_wall = (wall_tile is not None)
+
+        if visualizer_pipeline is not None and (has_applied_floor or has_applied_wall) and wm_np is not None and np.any(wm_np):
+            try:
+                lum_map = visualizer_pipeline.lighting_engine.extract_ambient_luminance(room_bgr)
+                ppm_val = pixels_per_meter if pixels_per_meter and pixels_per_meter > 10.0 else 200.0
+                composite, _ = visualizer_pipeline.wall_engine.generate_skirting_strip(
+                    composite,
+                    floor_mask=floor_mask_u8,
+                    wall_mask=wm_np,
+                    ppm=ppm_val,
+                    height_cm=10.0,
+                    material="mdf_dark_grey",
+                    luminance_map=lum_map,
+                    has_floor=has_applied_floor
+                )
+                if floor_fg_alpha is not None:
+                    fg_a = floor_fg_alpha[:, :, None] if floor_fg_alpha.ndim == 2 else floor_fg_alpha
+                    composite = composite * (1.0 - fg_a) + room_bgr.astype(np.float32) * fg_a
+                    composite = np.clip(composite, 0, 255).astype(np.uint8)
+            except Exception as skirt_err:
+                print(f"Skirting strip application notice: {skirt_err}")
 
         result_rgb = cv2.cvtColor(composite, cv2.COLOR_BGR2RGB)
         result_pil = Image.fromarray(result_rgb)

@@ -57,12 +57,22 @@ class PerspectiveEngine:
             far_lx = max(-float(W * 0.1), mid_far - min_far_w / 2.0)
             far_rx = min(float(W * 1.1), mid_far + min_far_w / 2.0)
 
+        # Architectural Room-Wide Floor Plane Guarantee:
+        # A room ground plane extends across the full width of the camera view regardless of foreground obstacles.
+        min_floor_x = float(xs.min()) if len(xs) else 0.0
+        max_floor_x = float(xs.max()) if len(xs) else float(W)
+        far_lx = min(far_lx, min_floor_x, -float(W * 0.05))
+        far_rx = max(far_rx, max_floor_x, float(W * 1.05))
+
         # Enforce trapezoidal outward flare
-        if near_rx - near_lx < (far_rx - far_lx) * 1.1:
+        if near_rx - near_lx < (far_rx - far_lx) * 1.15:
             cx = (near_lx + near_rx) / 2.0
-            hw = max((far_rx - far_lx) * 0.75, W * 0.55)
+            hw = max((far_rx - far_lx) * 0.75, W * 0.65)
             near_lx = cx - hw
             near_rx = cx + hw
+
+        near_lx = min(near_lx, far_lx - float(W * 0.15), -float(W * 0.20))
+        near_rx = max(near_rx, far_rx + float(W * 0.15), float(W * 1.20))
 
         # Extract per-column top floor boundary to compute true baseline angle
         col_has = final_mask.max(axis=0) > 0
@@ -204,30 +214,52 @@ class PerspectiveEngine:
             cv2.rotate(cell, cv2.ROTATE_180)
         ]
 
-        n_rows = int(np.ceil(ph / cell_h)) + 1
-        n_cols = int(np.ceil(pw / cell_w)) + 1
+        n_rows = int(np.ceil(ph / cell_h)) + 2
+        n_cols = int(np.ceil(pw / cell_w)) + 2
 
         for r in range(n_rows):
-            for c in range(n_cols):
-                ox = 0
-                if pattern == "brick" and (r % 2):
-                    ox = cell_w // 2
+            ox = (cell_w // 2) if (pattern == "brick" and (r % 2)) else 0
+            for c in range(-1, n_cols):
                 x1, y1 = c * cell_w + ox, r * cell_h
-                x2, y2 = min(x1 + cell_w, pw), min(y1 + cell_h, ph)
-                if x1 < pw and y1 < ph and x2 > x1 and y2 > y1:
-                    v = variants[(r * 3 + c * 7) % 4]
-                    surface[y1:y2, x1:x2] = v[:y2 - y1, :x2 - x1]
+                x2, y2 = x1 + cell_w, y1 + cell_h
+
+                dst_x1 = max(0, x1)
+                dst_y1 = max(0, y1)
+                dst_x2 = min(pw, x2)
+                dst_y2 = min(ph, y2)
+                src_x1 = max(0, -x1)
+                src_y1 = max(0, -y1)
+                src_x2 = src_x1 + (dst_x2 - dst_x1)
+                src_y2 = src_y1 + (dst_y2 - dst_y1)
+
+                if dst_x2 > dst_x1 and dst_y2 > dst_y1:
+                    v = variants[(r * 3 + (c + 2) * 7) % 4]
+                    surface[dst_y1:dst_y2, dst_x1:dst_x2] = v[src_y1:src_y2, src_x1:src_x2]
 
         # Apply realistic grout lines
         gw = int(max(0, grout_w))
         if gw > 0:
             g_col = tuple(int(c) for c in grout_col)
+            # Continuous horizontal seams
             for r in range(n_rows + 1):
                 y = min(ph - 1, r * cell_h)
                 surface[max(0, y - gw // 2):min(ph, y + (gw + 1) // 2), :] = g_col
-            for c in range(n_cols + 1):
-                x = min(pw - 1, c * cell_w)
-                surface[:, max(0, x - gw // 2):min(pw, x + (gw + 1) // 2)] = g_col
+
+            if pattern == "brick":
+                # Staggered vertical seams per row
+                for r in range(n_rows):
+                    y1 = r * cell_h
+                    y2 = min(ph, (r + 1) * cell_h)
+                    ox = (cell_w // 2) if (r % 2) else 0
+                    for c in range(-1, n_cols + 1):
+                        x = c * cell_w + ox
+                        if 0 <= x < pw:
+                            surface[y1:y2, max(0, x - gw // 2):min(pw, x + (gw + 1) // 2)] = g_col
+            else:
+                # Continuous vertical seams for standard grid
+                for c in range(n_cols + 1):
+                    x = min(pw - 1, c * cell_w)
+                    surface[:, max(0, x - gw // 2):min(pw, x + (gw + 1) // 2)] = g_col
 
         return surface
 

@@ -54,6 +54,12 @@ PROTECTED_STRUCTURAL_IDS = {
     132, # vase / pitcher
     135, # vase
     141, # crt screen
+    92,  # apparel / clothing / hanging clothes / coats / jackets
+    100, # poster / bulletin board / wall picture
+    111, # bulletin board / board
+    127, # whiteboard / blackboard / signboard
+    138, # footwear / shoes
+    142, # shoe / footwear
 }
 
 STRICT_OBSTACLE_IDS = PROTECTED_STRUCTURAL_IDS.union({
@@ -61,7 +67,7 @@ STRICT_OBSTACLE_IDS = PROTECTED_STRUCTURAL_IDS.union({
 })
 
 # Loose small non-structural clutter classes that may be suppressed on floor/table surfaces
-LOOSE_CLUTTER_IDS = {108, 131, 137, 138, 146}
+LOOSE_CLUTTER_IDS = {108, 131, 137, 146}
 
 class OcclusionDetector:
     def __init__(self):
@@ -245,10 +251,10 @@ class OcclusionDetector:
 
         fg_alpha = np.clip(mean_a * guide + mean_b, 0.0, 1.0)
         
-        # Smooth anti-aliasing: solid foreground obstacle core is fully opaque, outer boundary is feathered
-        core_fg = cv2.erode((fg_entities > 0).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        # Smooth anti-aliasing: protected foreground entities are strictly 100% opaque
+        # Outer boundary feathers smoothly into the tiled background
+        fg_alpha[fg_entities > 0] = 1.0
         penumbra_fg = cv2.dilate((fg_entities > 0).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
-        fg_alpha[core_fg] = 1.0
         fg_alpha[~penumbra_fg] = 0.0
 
         return fg_alpha
