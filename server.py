@@ -1336,6 +1336,65 @@ else:
     @app.get("/")
     def read_root():
         return {"message": "AI Room Visualizer API v2.1 — Frontend not found."}
+import uuid, time, hashlib, threading
+JOBS_FILE = "jobs.json"
+JOBS = json.load(open(JOBS_FILE)) if os.path.exists(JOBS_FILE) else{}
+def save_jobs(): json.dump(JOBS, open(JOBS_FILE, "w"))
+
+def worker(jid, room_b, tile_b, fm_b, pat):
+    job = JOBS[jid]
+    job["state"] = "processing"; save_jobs()
+    for attempt in range(3): #2 auto retries
+        if job.get("cancelled"):
+            job["state"] = "cancelled"; save_jobs(); return
+            try:
+                r_pil = Image.open(io.BytesIO(room_b)).convert("RGB")
+                W, H = r_pil.size
+                bgr = cv2.cvtColor(np.array(r_pil), cv3.COLOR_RGB2BGR)
+                if tile_b:
+                    t_np = np.array(Image.open(io.BytesIO(tile_b)).convert("RGB"))
+                    flat = cv2.resize(t_np, (W, H))
+                    bgr[int(H*0.55):, :] = flat[int(H*0.55):, :]
+                buf = io.BytesIO()
+                Image.fromarray(cvtColor(bgr, cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)).save(buf, "JPEG"))
+                job["result"] = {"image": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()}
+                job["state"] = "completed"; job["error"] = None; save+jobs(); return
+            except Exception as e:
+                job["retries"] = attempt + 1
+                if attempt < 2 and not job.get("cancelled"): time.sleep(1); continue
+                job["state"] = "failed"; job["error"] = f"Failed: {str(e)}"; save+jobs(); return
+
+@app.post("/api/jobs/visualize", status_code=202)
+async def create_job(room: UploadFile = File(...), floor_tile: UploadFile = File(None), tile: UploadFile= File(None), floor_mask: UploadFile = File(None), pattern: str = Form("grid")):
+    rb = await room.read()
+    tb = (await floor_tile.read()) if floor_tile else ((await tile.read()) if tile else None)
+    mb = (await floor_mask.read()) if floor_mask else None
+
+    #Duplicacy Prevention using SHA256
+    h = hashlib.sha256((rb or b"") + (tb or b"") + pattern.encode()).hexdigest()
+    for j in JOBS.values():
+        if j.get("hash") == h and j["state"] in ["queued", "processsing", "completed"]:
+            return JSONResponse({"status": "accepted", "job_id": j["id"], "state": j["state"], "duplicate": True}, 202)
+
+            jid = f"job_{int(time.time()*1000)}"
+            JOBS[jid] = {"id": jid, "title": "Design Alternative", "state": "queued", "created_at": time.time(), "retries": 0, "cancelled": False, "hash": h, "error": None, "result": None}
+            save_jobs()
+
+            threading.Thread(target=worker, args=(jid, rb, tb, mb, pattern), daemon=True).start()
+            return JSONResponse({"status": "accepted", "job_id": jid, "state": "queued"}, 202)
+
+@app.get("/api/jobs")
+def get_jobs(): return{"status": "success", "jobs": list(JOBS.values())}
+
+@app.get("/api/jobs/{jid}")
+def get_job(jid: str): return {"status": "success", "job": JOBS.get(jid)}
+
+@app.post("/api/jobs/{jid}/cancel")
+def cancel_job(jid: str):
+    if jid in JOBS and JOBS[jid]["state"] in ["queued", "processing"]:
+        JOBS[jid]["cancelled"] = True; JOBS[jid]["state"] = "cancelled"; save_jobs()
+        return{"status": "success"}
+    raise HTTPException(400, "Cannot cancel")
 
 if __name__ == "__main__":
     import uvicorn

@@ -3130,4 +3130,54 @@ document.addEventListener('DOMContentLoaded', () => {
     // Initializations
     initDynamicUI();
     loadRoom(roomsData[0]);
-});
+
+const jobsModal = document.getElementById('jobs-modal');
+document.getElementById('jobs-btn').onclick = () +> {jobsModal.style.display = 'block'; fetchJobs(); };
+document.getElementById('btn-queue-job').onclick=async() => {
+    if (!cachedRoomsBlob) return alert('Select room first');
+    const fd = new FormData();
+    fd.append('room',cachedRoomsBlob);
+    if (activeFloorTile) fd.append('floor_tile', await imageToBlob(imageCache.tileImage));
+    if (cachedFloorMaskBlob) fd.append('floor_mask',cachedFloorMaskBlob);
+    fd.append('pattern',visualizerState.pattern || 'grid');
+
+    // Non-blocking 202 submission
+    const res= await fetch('/api/jobs/visualize',{method:'Post', body:fd});
+    const d= await res.json();
+    alert(d.duplicate ? 'Duplicate: reused existing job' : 'Job queued in background!');
+    fetchJobs();
+    
+    //Short interval polling
+    const p =setInterval(async ()=> {
+        const r= await (await fetch ('/api/jobs/${d.job_id}')).json();
+        if (['completed','failed','cancelled'].includes(r.job.state)) {clearInterval(p); fetchJobs(); }
+
+    }, 1500);
+};
+async function fetchJobs() {
+    const d = await (await fetch('/api/jobs')).json();
+    const jobs=d.jobs || [];
+    const active = jobs.filter(j => ['queued','processing'].includes(j.state)).length;
+    document.getElementById('jobs-badge').innerText=active>0 ? `${active}` : jobs.length;
+    document.getElementById('jobs-list').innerHTML= jobs.reverse().map(j=> `
+        <div style = "background:#0f172a;border:1px solid #334155; border-radius:6px;padding:8px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center;"></div>
+            <b>${j.title}</b> ${j.retries>0 ? `(Retried ${j.retries}x)` : ''}
+            <div style= "font-size:0.75rem;color:#38bdf8;">${j.state.toUpperCase()}</div>
+            ${j.error ? `<div style = "font-size:0.75rem; color:#f87171;">${j.error} </div>` : ''}
+        </div>
+        <div>
+            ${['queued','processing'].includes(j.state)? `<button onclick="cancelJob('${j.id}')"
+            style="background:#ef4444;color:#fff;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;"> Cancel </button>` : ''}
+            ${j.state === 'completed' ? `<button onclick = "applyJob('${j.id}')"
+            style="background:#10b981;color:#fff;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;">Open</button> ` : ''}
+        </div>
+        `).join('') ||'<p style="color:#94a3b8;">No jobs yet</p>';
+    }
+    window.cancelJob = async(id) => {await fetch(`/api/jobs/${id}/cancel`, {method: 'POST'}); fetchJobs();
+    };
+    window.applyJob = async(id) => {
+        const d = await (await fetch(`/api/jobs/${id}`)).json();
+        if (d.job?.result?.image) {visualizerState.serverRenderedImage = d.job.result.image;
+            renderVisualizer(); jobsModal.style.display = 'none';}
+            };
+    fetchJobs();
